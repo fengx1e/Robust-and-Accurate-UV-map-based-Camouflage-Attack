@@ -1,4 +1,11 @@
 # Repo-specific GitIgnore ----------------------------------------------------------------------------------------------
+src/NRP_weights/
+src/Neural_Renderer_RAUCA/
+src/logs/
+src/runs/
+src/data/dataset/
+.idea/
+
 *.jpg
 *.jpeg
 *.png
