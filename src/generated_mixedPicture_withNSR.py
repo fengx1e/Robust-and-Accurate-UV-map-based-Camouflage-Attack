@@ -8,12 +8,12 @@ from PIL import Image
 import os
 from Image_Segmentation.network import U_Net
 import torch.nn as nn
-from utils.torch_utils import ModelEMA, select_device, intersect_dicts, torch_distributed_zero_first, de_parallel
+from rauca_utils.torch_utils import ModelEMA, select_device, intersect_dicts, torch_distributed_zero_first, de_parallel
 
 
 import neural_renderer
 from neural_renderer.save_obj import create_texture_image
-import utils.nmr_test as nmr
+import rauca_utils.nmr_test as nmr
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 #os.environ['TORCH_USE_CUDA_DSA'] = '1'
 parser = argparse.ArgumentParser()

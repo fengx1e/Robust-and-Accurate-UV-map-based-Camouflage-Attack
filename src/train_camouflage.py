@@ -2,6 +2,7 @@
 import argparse
 import logging
 import os
+import sys
 import time
 from pathlib import Path
 import multiprocessing as mp
@@ -12,18 +13,21 @@ import yaml
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from PIL import Image, ImageDraw
-from models.yolo import Model
-from utils.datasets_RAUCA import create_dataloader
-from utils.general_RAUCA import labels_to_class_weights, increment_path, labels_to_image_weights, init_seeds, \
+from rauca_utils.datasets_RAUCA import create_dataloader
+from rauca_utils.general_RAUCA import labels_to_class_weights, increment_path, labels_to_image_weights, init_seeds, \
      get_latest_run, check_dataset, check_file, check_git_status, check_img_size, \
     check_requirements, set_logging, colorstr
-from utils.google_utils import attempt_download
-from utils.loss_RAUCA import ComputeLoss
-from utils.torch_utils import ModelEMA, select_device, intersect_dicts, torch_distributed_zero_first, de_parallel
-# from utils.wandb_logging.wandb_utils import WandbLogger, check_wandb_resume
+from rauca_utils.google_utils import attempt_download
+from rauca_utils.torch_utils import ModelEMA, select_device, intersect_dicts, torch_distributed_zero_first
+from camouflage_eval import evaluate_camouflage_dataset
+# from rauca_utils.wandb_logging.wandb_utils import WandbLogger, check_wandb_resume
 import neural_renderer
 from PIL import Image
 from Image_Segmentation.network import U_Net
+
+from models.experimental import attempt_load as yolov7_attempt_load
+from models.yolo import Model as Yolov7Model
+from utils.loss import ComputeLoss as Yolov7ComputeLoss
 logger = logging.getLogger(__name__)
 with torch.autograd.set_detect_anomaly(True):
     # LOCAL_RANK = int(os.getenv('LOCAL_RANK', -1))  # https://pytorch.org/docs/stable/elastic/run.html
@@ -49,6 +53,17 @@ with torch.autograd.set_detect_anomaly(True):
         else:
             textures = 0.5 * (torch.nn.Tanh()(texture_param) + 1)
         return texture_origin * (1 - texture_mask) + texture_mask * textures  
+
+
+    def ensure_upsample_attributes(module):
+        """
+        Torch 2.x 在反序列化旧版 nn.Upsample 时不会自动补充
+        recompute_scale_factor，导致 forward 访问属性时报错。
+        这里遍历所有子模块，若缺失该属性则设置为 False。
+        """
+        for sub in module.modules():
+            if isinstance(sub, nn.Upsample) and not hasattr(sub, "recompute_scale_factor"):
+                sub.recompute_scale_factor = False
 
 
     def train(hyp, opt, device):
@@ -105,6 +120,8 @@ with torch.autograd.set_detect_anomaly(True):
                     :] = 1  
         texture_mask = torch.from_numpy(texture_mask).to(device).unsqueeze(0) 
         mask_dir = os.path.join(opt.datapath, 'masks/')
+        print(f"texture_param.device:{texture_param.device}")
+        print(f"texture_mask.device:{texture_mask.device}")
 
         # ---------------------------------#
         # -------Yolo-v3 setting-----------#
@@ -129,7 +146,12 @@ with torch.autograd.set_detect_anomaly(True):
         loggers = {'wandb': None}  # loggers dict
         if rank in [-1, 0]:
             opt.hyp = hyp  # add hyperparameters
-            run_id = torch.load(weights).get('wandb_id') if weights.endswith('.pt') and os.path.isfile(weights) else None
+            run_id = None
+            if weights.endswith('.pt') and os.path.isfile(weights):
+                try:
+                    run_id = torch.load(weights, map_location='cpu').get('wandb_id')
+                except Exception:
+                    run_id = None
             # wandb_logger = WandbLogger(opt, save_dir.stem, run_id, data_dict)
             # loggers['wandb'] = wandb_logger.wandb
             # data_dict = wandb_logger.data_dict
@@ -142,28 +164,21 @@ with torch.autograd.set_detect_anomaly(True):
 
         # Model
         pretrained = weights.endswith('.pt')
-        with torch_distributed_zero_first(rank):
-            weights = attempt_download(weights)  # download if not found locally
-        ckpt = torch.load(weights, map_location=device)  # load checkpoint
-        #print(f"ckpt['model']:{ckpt['model']}")
-        model = Model(opt.cfg or ckpt['model'].yaml, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
-        exclude = ['anchor'] if (opt.cfg or hyp.get('anchors')) and not opt.resume else []  # exclude keys 
-        state_dict = ckpt['model'].float().state_dict()  # to FP32
-        state_dict = intersect_dicts(state_dict, model.state_dict(), exclude=exclude)  # intersect
-        model.load_state_dict(state_dict, strict=False)  # load
-        logger.info('Transferred %g/%g items from %s' % (len(state_dict), len(model.state_dict()), weights))  # report
+        if pretrained and not os.path.isfile(weights):
+            with torch_distributed_zero_first(rank):
+                weights = attempt_download(weights)
+        ckpt = None
+        model = yolov7_attempt_load(weights, map_location=device)
+        model = model.to(device)
+        ensure_upsample_attributes(model)
+        model.nc = nc
+        model.names = names
+        model.hyp = hyp
+        logger.info(f'Loaded YOLOv7 weights from {weights}')
         with torch_distributed_zero_first(rank):
             check_dataset(data_dict)  # check
         train_path = data_dict['train']
         test_path = data_dict['val']
-
-        # Freeze
-        freeze = []  # parameter names to freeze (full or partial)
-        for k, v in model.named_parameters():
-            v.requires_grad = True  # train all layers
-            if any(x in k for x in freeze):
-                print('freezing %s' % k)
-                v.requires_grad = False
 
         # Optimizer
         nbs = 64  # nominal batch size
@@ -175,14 +190,9 @@ with torch.autograd.set_detect_anomaly(True):
         ema = ModelEMA(model) if rank in [-1, 0] else None
 
         # Resume
-        if pretrained:
-            # EMA
-            if ema and ckpt.get('ema'):
-                ema.ema.load_state_dict(ckpt['ema'].float().state_dict())
-                ema.updates = ckpt['updates']
-            # Results
-            if ckpt.get('training_results') is not None:
-                results_file.write_text(ckpt['training_results'])  # write results.txt
+        if pretrained and ema:
+            ema.ema.load_state_dict(model.state_dict())
+            ema.updates = 0
 
 
         # Image sizes
@@ -203,7 +213,8 @@ with torch.autograd.set_detect_anomaly(True):
         dataloader, dataset = create_dataloader(train_path, imgsz, batch_size, gs, faces, texture_size, vertices, opt,
                                                 hyp=hyp, augment=True, cache=opt.cache_images, rank=rank,
                                                 world_size=opt.world_size, workers=opt.workers,
-                                                prefix=colorstr('train: '), mask_dir=mask_dir, ret_mask=True)
+                                                prefix=colorstr('train: '), mask_dir=mask_dir, ret_mask=True,
+                                                camou_scale=opt.camou_scale)
 
         if cuda and rank != -1:
             model = DDP(model, device_ids=[opt.local_rank], output_device=opt.local_rank,
@@ -230,7 +241,7 @@ with torch.autograd.set_detect_anomaly(True):
         t0 = time.time()
         maps = np.zeros(nc)  # mAP per class
         results = (0, 0, 0, 0, 0, 0, 0)  # P, R, mAP@.5, mAP@.5-.95, val_loss(box, obj, cls)
-        compute_loss = ComputeLoss(model)  # init loss class
+        compute_loss = Yolov7ComputeLoss(model)  # init loss class
         # ---------------------------------#
         # ------------Training-------------#
         # ---------------------------------#
@@ -246,21 +257,23 @@ with torch.autograd.set_detect_anomaly(True):
         model_nsr.to(device)
 
         epoch_start=1+opt.continueFrom
-        net = torch.hub.load('yolov3',  'custom','yolov3_9_5.pt',source='local')  
+        net = yolov7_attempt_load(weights, map_location=device)
+        ensure_upsample_attributes(net)
         net.eval()
         net = net.to(device)
+        header_printed = False
         for epoch in range(epoch_start, epochs+1):  # epoch ------------------------------------------------------------------
             model_nsr.eval()
         #     batch = next(iter(dataloader))
         #     print(f"batch.shape:{batch.shape}")  
             pbar = enumerate(dataloader)
             # print(f"dataloader.dtype:{dataloader.dtype}")
-            print(f"texture_origin.device:{texture_origin.device}")
-            print(f"texture_param.device:{texture_param.device}")
-            print(f"texture_mask.device:{texture_mask.device}")
+            last_texture_img_np = None
             textures = cal_texture(texture_param, texture_origin, texture_mask) 
             dataset.set_textures(textures) 
-            logger.info(('\n' + '%10s' * 8) % ('Epoch', 'gpu_mem', 'a_ls', 's_ls','t_loss','labels','tex_mean','grad_mean'))
+            if not header_printed:
+                logger.info(('\n' + '%10s' * 8) % ('Epoch', 'gpu_mem', 'a_ls', 's_ls','t_loss','labels','tex_mean','grad_mean'))
+                header_printed = True
             if rank in [-1, 0]:
                 pbar = tqdm(pbar, total=nb)  # progress bar
             model.eval() 
@@ -295,15 +308,15 @@ with torch.autograd.set_detect_anomaly(True):
                 
                 imgs=(1 - masks) * imgs +(255 * tensor3) * masks
                 imgs = imgs.to(device, non_blocking=True).float() / 255.0 
-                out, train_out = model(imgs)  # forward
+                out, train_out = model(imgs)  # forward (in eval mode returns inference preds + raw heads)
                 texture_img_np = 255*(imgs.detach()).data.cpu().numpy()[0]
                 texture_img_np = Image.fromarray(np.transpose(texture_img_np, (1, 2, 0)).astype('uint8'))
-                imgs_show=net(texture_img_np)
-                imgs_show.save(log_dir)
+                last_texture_img_np = texture_img_np
                 # compute loss
 
-                loss1 = compute_loss(out, targets.to(
-                    device)) 
+                targets = targets.to(device)
+                loss_det, _ = compute_loss(train_out, targets)
+                loss1 = loss_det
 
 
                 
@@ -366,6 +379,16 @@ with torch.autograd.set_detect_anomaly(True):
                 #update texture_param
                 textures = cal_texture(texture_param, texture_origin, texture_mask)
                 dataset.set_textures(textures)
+            if last_texture_img_np is not None:
+                try:
+                    img_np = np.array(last_texture_img_np)
+                    img_tensor = torch.from_numpy(img_np).permute(2, 0, 1).unsqueeze(0).to(device).float() / 255.0
+                    with torch.no_grad():
+                        net(img_tensor)
+                except Exception as e:
+                    logger.warning(f'YOLOv7 visualization failed: {e}')
+                save_path = os.path.join(log_dir, f'epoch_{epoch:04d}_final.png')
+                last_texture_img_np.save(save_path)
             # end epoch ----------------------------------------------------------------------------------------------------
         # end training
             tb_writer.add_scalar("meanTLoss", mloss[0], epoch)
@@ -373,6 +396,27 @@ with torch.autograd.set_detect_anomaly(True):
             tb_writer.add_scalar("AllSLoss",a_mloss, epoch)
             if epoch % 1 == 0:
                 np.save(os.path.join(log_dir, f'texture_{epoch}.npy'), texture_param.data.cpu().numpy())
+        final_textures = cal_texture(texture_param, texture_origin, texture_mask)
+        dataset.set_textures(final_textures)
+
+        if rank in [-1, 0]:
+            eval_loader, eval_dataset = create_dataloader(train_path, imgsz, 1, gs, faces, texture_size, vertices, opt,
+                                                          hyp=hyp, augment=False, cache=False, rank=rank,
+                                                          world_size=opt.world_size, workers=opt.workers,
+                                                          prefix=colorstr('train-eval: '), mask_dir=mask_dir,
+                                                          ret_mask=True, camou_scale=opt.camou_scale)
+            eval_dir = os.path.join(save_dir, 'train_eval')
+            if isinstance(texture_origin, torch.Tensor):
+                clean_tex = texture_origin.detach().clone()
+            else:
+                clean_tex = torch.from_numpy(texture_origin).to(device)
+            eval_stats = evaluate_camouflage_dataset(net, eval_dataset, device, names, eval_dir,
+                                                     clean_tex, final_textures,
+                                                     conf_thres=opt.conf_thres, iou_thres=opt.iou_thres,
+                                                     logger=logger)
+            logger.info(f"Training ASR: {eval_stats['asr'] * 100:.2f}% "
+                        f"({eval_stats['success']}/{max(eval_stats['total'], 1)})")
+
         np.save(os.path.join(log_dir, 'texture.npy'), texture_param.data.cpu().numpy())
 
         torch.cuda.empty_cache()
@@ -385,7 +429,6 @@ with torch.autograd.set_detect_anomaly(True):
         for key in logs.keys():
             dir_name += str(key) + '-' + str(logs[key]) + '+'
         dir_name = 'logs/' + dir_name
-        print(dir_name)
         if not (os.path.exists(dir_name)):
             os.makedirs(dir_name)
         log_dir = dir_name
@@ -397,7 +440,7 @@ with torch.autograd.set_detect_anomaly(True):
         parser = argparse.ArgumentParser()
         # hyperparameter for training adversarial camouflage
         # ------------------------------------#
-        parser.add_argument('--weights', type=str, default='yolov3_9_5.pt', help='initial weights path')
+        parser.add_argument('--weights', type=str, default='weights/yolov7.pt', help='initial weights path')
         parser.add_argument('--cfg', type=str, default='', help='model.yaml path')
         parser.add_argument('--data', type=str, default='data/carla.yaml', help='data.yaml path')
         parser.add_argument('--lr', type=float, default=0.01, help='learning rate for texture_param')
@@ -433,6 +476,7 @@ with torch.autograd.set_detect_anomaly(True):
         parser.add_argument('--project', default='runs/train', help='save to project/name')
         parser.add_argument('--name', default='exp', help='save to project/name')
         parser.add_argument('--exist-ok', action='store_true', help='existing project/name ok, do not increment')
+        parser.add_argument('--camou-scale', type=float, default=1.0, help='scale factor for rendered camouflage (>1 enlarges)')
         parser.add_argument('--bbox_interval', type=int, default=-1, help='Set bounding-box image logging interval for W&B')
         parser.add_argument('--save_period', type=int, default=-1, help='Log model after every "save_period" epoch')
         parser.add_argument('--conf-thres', type=float, default=0.25, help='confidence threshold')
