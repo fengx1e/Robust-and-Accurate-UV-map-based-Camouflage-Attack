@@ -447,7 +447,7 @@ with torch.autograd.set_detect_anomaly(True):
         parser.add_argument('--obj_file', type=str, default='car_assets/audi_et_te.obj', help='3d car model obj') #3D车模
         parser.add_argument('--vertex-offset-x', type=float, default=0.0, help='x-axis offset for vertices')
         parser.add_argument('--vertex-offset-y', type=float, default=0.0, help='y-axis offset for vertices')
-        parser.add_argument('--vertex-offset-z', type=float, default=0.0, help='z-axis offset for vertices')
+        parser.add_argument('--vertex-offset-z', type=float, default=0.33, help='z-axis offset for vertices')
         parser.add_argument('--faces', type=str, default='car_assets/exterior_face.txt',
                             help='exterior_face file  (exterior_face, all_faces)')
         parser.add_argument('--datapath', type=str, default='{datapath}',
