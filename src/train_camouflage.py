@@ -78,6 +78,9 @@ with torch.autograd.set_detect_anomaly(True):
         # ---------------------------------#
         texture_size = opt.texturesize 
         vertices, faces, texture_origin = neural_renderer.load_obj(filename_obj=opt.obj_file, texture_size=texture_size,load_texture=True)  
+        if opt.vertex_offset_x or opt.vertex_offset_y or opt.vertex_offset_z:
+            offset = torch.tensor([opt.vertex_offset_x, opt.vertex_offset_y, opt.vertex_offset_z], device=vertices.device)
+            vertices = vertices + offset
         
        
         # texture_255=np.ones((1, faces.shape[0], texture_size, texture_size, texture_size, 3)).astype('float32') 
@@ -400,22 +403,19 @@ with torch.autograd.set_detect_anomaly(True):
         dataset.set_textures(final_textures)
 
         if rank in [-1, 0]:
-            eval_loader, eval_dataset = create_dataloader(train_path, imgsz, 1, gs, faces, texture_size, vertices, opt,
-                                                          hyp=hyp, augment=False, cache=False, rank=rank,
-                                                          world_size=opt.world_size, workers=opt.workers,
-                                                          prefix=colorstr('train-eval: '), mask_dir=mask_dir,
-                                                          ret_mask=True, camou_scale=opt.camou_scale)
-            eval_dir = os.path.join(save_dir, 'train_eval')
-            if isinstance(texture_origin, torch.Tensor):
-                clean_tex = texture_origin.detach().clone()
-            else:
-                clean_tex = torch.from_numpy(texture_origin).to(device)
-            eval_stats = evaluate_camouflage_dataset(net, eval_dataset, device, names, eval_dir,
-                                                     clean_tex, final_textures,
-                                                     conf_thres=opt.conf_thres, iou_thres=opt.iou_thres,
+            eval_dir = os.path.join(opt.save_dir, 'train_eval')
+            clean_tex = texture_origin.detach().clone() if isinstance(texture_origin, torch.Tensor) else torch.from_numpy(texture_origin).to(device)
+            eval_stats = evaluate_camouflage_dataset(net,
+                                                     dataset,
+                                                     device,
+                                                     names,
+                                                     eval_dir,
+                                                     clean_tex,
+                                                     final_textures,
+                                                     conf_thres=opt.conf_thres,
+                                                     iou_thres=opt.iou_thres,
                                                      logger=logger)
-            logger.info(f"Training ASR: {eval_stats['asr'] * 100:.2f}% "
-                        f"({eval_stats['success']}/{max(eval_stats['total'], 1)})")
+            logger.info(f"Training ASR: {eval_stats['asr'] * 100:.2f}% ({eval_stats['success']}/{max(eval_stats['total'], 1)})")
 
         np.save(os.path.join(log_dir, 'texture.npy'), texture_param.data.cpu().numpy())
 
@@ -445,6 +445,9 @@ with torch.autograd.set_detect_anomaly(True):
         parser.add_argument('--data', type=str, default='data/carla.yaml', help='data.yaml path')
         parser.add_argument('--lr', type=float, default=0.01, help='learning rate for texture_param')
         parser.add_argument('--obj_file', type=str, default='car_assets/audi_et_te.obj', help='3d car model obj') #3D车模
+        parser.add_argument('--vertex-offset-x', type=float, default=0.0, help='x-axis offset for vertices')
+        parser.add_argument('--vertex-offset-y', type=float, default=0.0, help='y-axis offset for vertices')
+        parser.add_argument('--vertex-offset-z', type=float, default=0.0, help='z-axis offset for vertices')
         parser.add_argument('--faces', type=str, default='car_assets/exterior_face.txt',
                             help='exterior_face file  (exterior_face, all_faces)')
         parser.add_argument('--datapath', type=str, default='{datapath}',
@@ -476,7 +479,7 @@ with torch.autograd.set_detect_anomaly(True):
         parser.add_argument('--project', default='runs/train', help='save to project/name')
         parser.add_argument('--name', default='exp', help='save to project/name')
         parser.add_argument('--exist-ok', action='store_true', help='existing project/name ok, do not increment')
-        parser.add_argument('--camou-scale', type=float, default=1.0, help='scale factor for rendered camouflage (>1 enlarges)')
+        parser.add_argument('--camou-scale', type=float, default=1.8, help='scale factor for rendered camouflage (>1 enlarges)')
         parser.add_argument('--bbox_interval', type=int, default=-1, help='Set bounding-box image logging interval for W&B')
         parser.add_argument('--save_period', type=int, default=-1, help='Log model after every "save_period" epoch')
         parser.add_argument('--conf-thres', type=float, default=0.25, help='confidence threshold')
