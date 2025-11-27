@@ -407,19 +407,18 @@ with torch.autograd.set_detect_anomaly(True):
         if rank in [-1, 0]:
             eval_dir = os.path.join(opt.save_dir, 'train_eval')
             clean_tex = texture_origin.detach().clone() if isinstance(texture_origin, torch.Tensor) else torch.from_numpy(texture_origin).to(device)
-            eval_stats = evaluate_camouflage_dataset(net,
-                                                     dataset,
-                                                     device,
-                                                     names,
-                                                     eval_dir,
-                                                     clean_tex,
-                                                     final_textures,
-                                                     conf_thres=opt.conf_thres,
-                                                     iou_thres=opt.iou_thres,
-                                                     logger=logger,
-                                                     clean_label='texture_origin',
-                                                     adv_label=final_texture_path)
-            logger.info(f"Training ASR: {eval_stats['asr'] * 100:.2f}% ({eval_stats['success']}/{max(eval_stats['total'], 1)})")
+            evaluate_camouflage_dataset(net,
+                                        dataset,
+                                        device,
+                                        names,
+                                        eval_dir,
+                                        clean_tex,
+                                        final_textures,
+                                        conf_thres=opt.conf_thres,
+                                        iou_thres=opt.iou_thres,
+                                        logger=logger,
+                                        clean_label='texture_origin',
+                                        adv_label=final_texture_path)
 
         torch.cuda.empty_cache()
         return results

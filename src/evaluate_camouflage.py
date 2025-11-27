@@ -141,20 +141,19 @@ def main(opt):
 
     save_dir = increment_path(Path(opt.save_dir) / 'exp', exist_ok=False)
     clean_tex = texture_origin.detach().clone()
-    stats = evaluate_camouflage_dataset(model,
-                                        eval_dataset,
-                                        device,
-                                        names,
-                                        save_dir,
-                                        clean_tex,
-                                        adv_textures,
-                                        conf_thres=opt.conf_thres,
-                                        iou_thres=opt.iou_thres,
-                                        logger=logger,
-                                        clean_label='texture_origin',
-                                        adv_label=str(Path(opt.texture_npy).resolve()))
+    evaluate_camouflage_dataset(model,
+                                eval_dataset,
+                                device,
+                                names,
+                                save_dir,
+                                clean_tex,
+                                adv_textures,
+                                conf_thres=opt.conf_thres,
+                                iou_thres=opt.iou_thres,
+                                logger=logger,
+                                clean_label='texture_origin',
+                                adv_label=str(Path(opt.texture_npy).resolve()))
     logger.info(f"Evaluation complete. Outputs saved to {save_dir.resolve()}")
-    logger.info(f"ASR: {stats['asr'] * 100:.2f}% ({stats['success']}/{max(stats['total'], 1)})")
 
 
 if __name__ == '__main__':
