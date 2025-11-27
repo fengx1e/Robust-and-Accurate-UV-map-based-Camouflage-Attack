@@ -401,6 +401,8 @@ with torch.autograd.set_detect_anomaly(True):
                 np.save(os.path.join(log_dir, f'texture_{epoch}.npy'), texture_param.data.cpu().numpy())
         final_textures = cal_texture(texture_param, texture_origin, texture_mask)
         dataset.set_textures(final_textures)
+        final_texture_path = os.path.join(log_dir, 'texture.npy')
+        np.save(final_texture_path, texture_param.data.cpu().numpy())
 
         if rank in [-1, 0]:
             eval_dir = os.path.join(opt.save_dir, 'train_eval')
@@ -414,10 +416,10 @@ with torch.autograd.set_detect_anomaly(True):
                                                      final_textures,
                                                      conf_thres=opt.conf_thres,
                                                      iou_thres=opt.iou_thres,
-                                                     logger=logger)
+                                                     logger=logger,
+                                                     clean_label='texture_origin',
+                                                     adv_label=final_texture_path)
             logger.info(f"Training ASR: {eval_stats['asr'] * 100:.2f}% ({eval_stats['success']}/{max(eval_stats['total'], 1)})")
-
-        np.save(os.path.join(log_dir, 'texture.npy'), texture_param.data.cpu().numpy())
 
         torch.cuda.empty_cache()
         return results
@@ -425,13 +427,11 @@ with torch.autograd.set_detect_anomaly(True):
     log_dir = ""
     def make_log_dir(logs):
         global log_dir
-        dir_name = ""
-        for key in logs.keys():
-            dir_name += str(key) + '-' + str(logs[key]) + '+'
-        dir_name = 'logs/' + dir_name
-        if not (os.path.exists(dir_name)):
-            os.makedirs(dir_name)
-        log_dir = dir_name
+        epoch = logs.get('epoch', '')
+        weight_name = Path(logs.get('weights', 'weights')).stem
+        dir_path = Path('logs') / f'epoch-{epoch}' / weight_name
+        dir_path.mkdir(parents=True, exist_ok=True)
+        log_dir = str(dir_path)
 
 
 
@@ -440,7 +440,7 @@ with torch.autograd.set_detect_anomaly(True):
         parser = argparse.ArgumentParser()
         # hyperparameter for training adversarial camouflage
         # ------------------------------------#
-        parser.add_argument('--weights', type=str, default='weights/yolov7.pt', help='initial weights path')
+        parser.add_argument('--weights', type=str, default='weights/yolov7-e6e.pt', help='initial weights path')
         parser.add_argument('--cfg', type=str, default='', help='model.yaml path')
         parser.add_argument('--data', type=str, default='data/carla.yaml', help='data.yaml path')
         parser.add_argument('--lr', type=float, default=0.01, help='learning rate for texture_param')
@@ -450,8 +450,8 @@ with torch.autograd.set_detect_anomaly(True):
         parser.add_argument('--vertex-offset-z', type=float, default=0.33, help='z-axis offset for vertices')
         parser.add_argument('--faces', type=str, default='car_assets/exterior_face.txt',
                             help='exterior_face file  (exterior_face, all_faces)')
-        parser.add_argument('--datapath', type=str, default='{datapath}',
-                            help='data path')
+        parser.add_argument('--datapath', type=str, default='data/dataset',
+                            help='data root path (npz/png/txt/masks)')
         parser.add_argument('--patchInitial', type=str, default='random_right',
                             help='data path')
         parser.add_argument('--device', default='0', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
@@ -479,7 +479,7 @@ with torch.autograd.set_detect_anomaly(True):
         parser.add_argument('--project', default='runs/train', help='save to project/name')
         parser.add_argument('--name', default='exp', help='save to project/name')
         parser.add_argument('--exist-ok', action='store_true', help='existing project/name ok, do not increment')
-        parser.add_argument('--camou-scale', type=float, default=1.8, help='scale factor for rendered camouflage (>1 enlarges)')
+        parser.add_argument('--camou-scale', type=float, default=1.7, help='scale factor for rendered camouflage (>1 enlarges)')
         parser.add_argument('--bbox_interval', type=int, default=-1, help='Set bounding-box image logging interval for W&B')
         parser.add_argument('--save_period', type=int, default=-1, help='Log model after every "save_period" epoch')
         parser.add_argument('--conf-thres', type=float, default=0.25, help='confidence threshold')
