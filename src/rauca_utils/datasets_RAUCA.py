@@ -123,13 +123,27 @@ class _RepeatSampler(object):
             yield from iter(self.sampler)
 
 
+def _replace_subdir(path, pairs):
+    for src, dst in pairs:
+        token = os.sep + src + os.sep
+        if token in path:
+            return path.replace(token, os.sep + dst + os.sep, 1)
+    return path
+
+
 def img2label_paths(img_paths, phase='training'):
     # Define label paths as a function of image paths
-    if phase == 'training':
-        sa, sb = os.sep + 'train_new' + os.sep, os.sep + 'train_label_new' + os.sep  # /images/, /labels/ substrings
-    else:
-        sa, sb = os.sep + 'test_new' + os.sep, os.sep + 'test_label_new' + os.sep  # /images/, /labels/ substrings
-    return ['txt'.join(x.replace(sa, sb, 1).rsplit(x.split('.')[-1], 1)) for x in img_paths]
+    pairs = [
+        ('train_new', 'train_label_new'),
+        ('val_new', 'val_label_new'),
+        ('test_new', 'test_label_new'),
+    ]
+    results = []
+    for path in img_paths:
+        suffix = path.split('.')[-1]
+        replaced = _replace_subdir(path, pairs)
+        results.append('txt'.join(replaced.rsplit(suffix, 1)))
+    return results
 
 
 class LoadImagesAndLabels(Dataset):  # for training/testing
@@ -385,8 +399,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         # print(mask.shape)
         # Applying mask, the transformation function in paper
         img = (1 - mask) * img + (255 * imgs_pred) * mask
-        imgs_pred=mask*imgs_pred
-        
+        imgs_pred = mask * imgs_pred
         # return img.squeeze(0), imgs_pred.squeeze(0), mask, imgs_ref.squeeze(0),img_cut.squeeze(0),labels_out, self.img_files[index], shapes
         return img.squeeze(0), imgs_pred.squeeze(0), mask,img_cut.squeeze(0),labels_out, self.img_files[index], shapes
 
@@ -459,6 +472,12 @@ def load_image(self, index):
 
     # loads 1 image from dataset, returns img, original hw, resized hw
     path = self.img_files[index]
+    if not path.endswith('.npz'):
+        mapping = [('train_new', 'train'), ('val_new', 'val'), ('test_new', 'test')]
+        mapped = _replace_subdir(path, mapping)
+        candidate = os.path.splitext(mapped)[0] + '.npz'
+        if os.path.exists(candidate):
+            path = candidate
     if self.phase == 'training':
         sa, sb = os.sep + 'train_new' + os.sep, os.sep + 'train' + os.sep  # /images/, /labels/ substrings
     else:

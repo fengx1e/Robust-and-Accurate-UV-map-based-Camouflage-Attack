@@ -8,7 +8,7 @@
 path: data/dataset  # dataset root dir
 #path: /data/zhoujw/phy_attack
 train: train_new  # the train image folder, and the "train_label_new" is the folder of training annotation label. (note that: image rather than npz, while you can modify this on 123-129 and 414-417 in datasets_fca.py)
-val: val_images  # no used
+val: test_new  # no used
 test:  # test images (optional)
 
 # Classes
