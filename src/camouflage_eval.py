@@ -8,6 +8,7 @@ from PIL import Image
 
 from utils.general import non_max_suppression, scale_coords, xywh2xyxy, box_iou
 from utils.plots import plot_one_box, color_list
+from utils.metrics import ap_per_class
 
 
 def _ensure_dir(path: Path):
@@ -89,6 +90,17 @@ def _compute_asr(labels: torch.Tensor, preds: torch.Tensor, img_shape: Tuple[int
     return success, total
 
 
+def _prepare_targets(labels: torch.Tensor, img_shape: Tuple[int, int]):
+    if labels is None or labels.numel() == 0:
+        return torch.zeros((0, 4)), torch.zeros(0, dtype=torch.long)
+    labels = labels.detach().cpu()
+    boxes = xywh2xyxy(labels[:, 2:6])
+    boxes[:, [0, 2]] *= img_shape[1]
+    boxes[:, [1, 3]] *= img_shape[0]
+    classes = labels[:, 1].long()
+    return boxes, classes
+
+
 @torch.no_grad()
 def evaluate_camouflage_dataset(model,
                                 dataset,
@@ -99,7 +111,9 @@ def evaluate_camouflage_dataset(model,
                                 adv_textures,
                                 conf_thres=0.25,
                                 iou_thres=0.45,
-                                logger=None):
+                                logger=None,
+                                clean_label=None,
+                                adv_label=None):
     save_root = Path(save_root)
     clean_dir = save_root / "clean"
     camo_dir = save_root / "camouflage"
@@ -108,10 +122,11 @@ def evaluate_camouflage_dataset(model,
 
     model.eval()
 
-    def run_pass(target_dir: Path, textures, compute_asr=False):
+    def run_pass(target_dir: Path, textures, compute_asr=False, collect_stats=False):
         dataset.set_textures(_prepare_textures(textures, dataset.device))
         success_total = 0
         object_total = 0
+        stats = [] if collect_stats else None
         for idx in range(len(dataset)):
             sample = dataset[idx]
             img_tensor = sample[0]
@@ -126,15 +141,70 @@ def evaluate_camouflage_dataset(model,
                 success, total = _compute_asr(labels, preds, image_np.shape[:2])
                 success_total += success
                 object_total += total
-        return success_total, object_total
+            if collect_stats:
+                gt_boxes, gt_cls = _prepare_targets(labels, image_np.shape[:2])
+                if preds is None or len(preds) == 0:
+                    if gt_cls.numel():
+                        stats.append((torch.zeros((0, 1), dtype=torch.bool),
+                                      torch.zeros(0),
+                                      torch.zeros(0),
+                                      gt_cls))
+                    continue
+                pred_boxes = preds[:, :4]
+                pred_scores = preds[:, 4]
+                pred_cls = preds[:, 5].long()
+                correct = torch.zeros(pred_boxes.shape[0], dtype=torch.bool)
+                if gt_cls.numel():
+                    ious = box_iou(gt_boxes, pred_boxes)
+                    detected = []
+                    for pred_idx, pc in enumerate(pred_cls):
+                        matches = torch.where((pc == gt_cls) & (ious[:, pred_idx] > 0.5))[0]
+                        if matches.numel():
+                            best = ious[matches, pred_idx].argmax()
+                            t = matches[best]
+                            if t.item() not in detected:
+                                detected.append(t.item())
+                                correct[pred_idx] = True
+                stats.append((correct[:, None].cpu(), pred_scores.cpu(), pred_cls.cpu(), gt_cls.cpu()))
+        return success_total, object_total, stats
+
+    def _log_texture_info(label, tex, source=None):
+        if tex is None:
+            return
+        try:
+            t = tex.detach().float()
+            extra = f" (source={source})" if source else ""
+            msg = (f"{label} texture stats{extra} - shape {tuple(t.shape)}, "
+                   f"min {t.min().item():.3f}, max {t.max().item():.3f}, "
+                   f"mean {t.mean().item():.3f}")
+            if logger:
+                logger.info(msg)
+            else:
+                print(msg)
+        except Exception:
+            pass
 
     if clean_textures is not None:
-        run_pass(clean_dir, clean_textures, compute_asr=False)
-    success, total = run_pass(camo_dir, adv_textures, compute_asr=True)
+        run_pass(clean_dir, clean_textures, compute_asr=False, collect_stats=False)
+    success, total, stats = run_pass(camo_dir, adv_textures, compute_asr=True, collect_stats=True)
     asr = (success / total) if total > 0 else 0.0
+    ap50 = 0.0
+    if stats and len(stats):
+        stats_cat = []
+        for s in zip(*stats):
+            if len(s) and s[0].numel():
+                stats_cat.append(torch.cat(s, 0).cpu().numpy())
+            else:
+                stats_cat.append(np.array([]))
+        if stats_cat and stats_cat[0].size:
+            p, r, ap, f1, ap_class = ap_per_class(*stats_cat, plot=False, v5_metric=False)
+            if ap.size:
+                ap50 = float(ap[:, 0].mean())
     msg = f"Camouflage ASR: {asr * 100:.2f}% ({success}/{max(total,1)})"
     if logger:
         logger.info(msg)
+        logger.info(f"Camouflage AP@0.5: {ap50 * 100:.2f}%")
     else:
         print(msg)
-    return {"asr": asr, "success": success, "total": total}
+        print(f"Camouflage AP@0.5: {ap50 * 100:.2f}%")
+    return {"asr": asr, "success": success, "total": total, "ap50": ap50}
